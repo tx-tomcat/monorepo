@@ -4,10 +4,13 @@
 //! - This wrapper tracks a synthetic global `size` (next append location) and maps it to
 //!   sections via `items_per_section` when appending.
 //! - Callers must prepare the variable journal (e.g., `init_sync`) and compute the initial
-//!   `size` from a replay that considers only `[lower_bound, upper_bound]`.
+//!   `size` from a replay that considers only `[range.start, range.end)`.
 //! - No pruning/bound checks are done here; the sync engine handles range validation.
 
-use crate::{adb::sync, journal::variable, store::operation::Variable};
+use crate::{
+    adb::{operation::variable::Operation, sync},
+    journal::variable,
+};
 use commonware_codec::Codec;
 use commonware_runtime::{Metrics, Storage};
 use commonware_utils::Array;
@@ -24,13 +27,14 @@ where
     V: Codec,
 {
     /// Underlying variable journal storing the operations.
-    inner: variable::Journal<E, Variable<K, V>>,
+    inner: variable::Journal<E, Operation<K, V>>,
 
     /// Logical operations per storage section.
     items_per_section: NonZeroU64,
 
     /// Logical next append location (number of ops present).
-    /// Invariant: computed by caller so `lower_bound <= size <= upper_bound + 1`.
+    /// Invariant: computed by caller so `range.start <= size <= range.end`
+    /// for the sync range.
     size: u64,
 }
 
@@ -48,7 +52,7 @@ where
     /// * `items_per_section` - Operations per section.
     /// * `size` - Logical next append location to report.
     pub fn new(
-        inner: variable::Journal<E, Variable<K, V>>,
+        inner: variable::Journal<E, Operation<K, V>>,
         items_per_section: NonZeroU64,
         size: u64,
     ) -> Self {
@@ -60,7 +64,7 @@ where
     }
 
     /// Return the inner [variable::Journal].
-    pub fn into_inner(self) -> variable::Journal<E, Variable<K, V>> {
+    pub fn into_inner(self) -> variable::Journal<E, Operation<K, V>> {
         self.inner
     }
 }
@@ -71,7 +75,7 @@ where
     K: Array,
     V: Codec,
 {
-    type Op = Variable<K, V>;
+    type Op = Operation<K, V>;
     type Error = crate::journal::Error;
 
     async fn size(&self) -> Result<u64, Self::Error> {
@@ -82,10 +86,12 @@ where
         let section = self.size / self.items_per_section;
         self.inner.append(section, op).await?;
         self.size += 1;
+        if self.size > 0 && self.size % self.items_per_section == 0 {
+            // Sync this full section before appending to the next section.
+            // TODO(#1718): Migrate to the new contiguous variable journal type, which will handle section
+            // calculation and syncing internally.
+            self.inner.sync(section).await?;
+        }
         Ok(())
-    }
-
-    async fn close(self) -> Result<(), Self::Error> {
-        self.inner.close().await
     }
 }

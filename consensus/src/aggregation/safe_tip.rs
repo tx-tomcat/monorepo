@@ -37,7 +37,7 @@ impl<P: Array> SafeTip<P> {
     /// # Panics
     ///
     /// Panics if the validator set is empty or if the validators are not unique.
-    pub fn init(&mut self, validators: &Vec<P>) {
+    pub fn init(&mut self, validators: &[P]) {
         // Ensure the validator set is not empty and all validators are unique
         assert!(!validators.is_empty());
 
@@ -70,7 +70,7 @@ impl<P: Array> SafeTip<P> {
     /// # Panics
     ///
     /// Panics if the new validator set is not unique and the same size as the existing set.
-    pub fn reconcile(&mut self, validators: &Vec<P>) {
+    pub fn reconcile(&mut self, validators: &[P]) {
         // Verify the new validators and collect them into a set.
         assert!(
             validators.len() == self.tips.len(),
@@ -287,30 +287,30 @@ mod tests {
         // Test init with empty validator set
         let mut safe_tip = SafeTip::<PublicKey>::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            safe_tip.init(&vec![]);
+            safe_tip.init(&[]);
         }));
         assert!(result.is_err());
 
         // Test init with duplicate validators
         let mut safe_tip = SafeTip::<PublicKey>::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            safe_tip.init(&vec![key(1), key(1), key(2), key(3)]);
+            safe_tip.init(&[key(1), key(1), key(2), key(3)]);
         }));
         assert!(result.is_err());
 
         // Test reconcile with size mismatch
         let mut safe_tip = SafeTip::<PublicKey>::default();
-        safe_tip.init(&vec![key(1), key(2), key(3), key(4)]);
+        safe_tip.init(&[key(1), key(2), key(3), key(4)]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            safe_tip.reconcile(&vec![key(1), key(2), key(3)]);
+            safe_tip.reconcile(&[key(1), key(2), key(3)]);
         }));
         assert!(result.is_err());
 
         // Test reconcile with duplicate validators
         let mut safe_tip = SafeTip::<PublicKey>::default();
-        safe_tip.init(&vec![key(1), key(2), key(3), key(4)]);
+        safe_tip.init(&[key(1), key(2), key(3), key(4)]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            safe_tip.reconcile(&vec![key(1), key(1), key(2), key(3)]);
+            safe_tip.reconcile(&[key(1), key(1), key(2), key(3)]);
         }));
         assert!(result.is_err());
 

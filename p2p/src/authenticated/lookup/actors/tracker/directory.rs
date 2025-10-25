@@ -2,14 +2,15 @@ use super::{metrics::Metrics, record::Record, Metadata, Reservation};
 use crate::authenticated::lookup::{actors::tracker::ingress::Releaser, metrics};
 use commonware_cryptography::PublicKey;
 use commonware_runtime::{Clock, Metrics as RuntimeMetrics, Spawner};
+use commonware_utils::set::Ordered;
 use governor::{
     clock::Clock as GClock, middleware::NoOpMiddleware, state::keyed::HashMapStateStore, Quota,
     RateLimiter,
 };
 use rand::Rng;
 use std::{
-    collections::{BTreeMap, HashMap},
-    net::SocketAddr,
+    collections::{BTreeMap, HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
 };
 use tracing::debug;
 
@@ -26,9 +27,7 @@ pub struct Config {
 }
 
 /// Represents a collection of records for all peers.
-pub struct Directory<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> {
-    context: E,
-
+pub struct Directory<E: Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> {
     // ---------- Configuration ----------
     /// The maximum number of peer sets to track.
     max_sets: usize,
@@ -49,7 +48,7 @@ pub struct Directory<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: Publ
 
     // ---------- Message-Passing ----------
     /// The releaser for the tracker actor.
-    releaser: Releaser<E, C>,
+    releaser: Releaser<C>,
 
     // ---------- Metrics ----------
     /// The metrics for the records.
@@ -58,23 +57,19 @@ pub struct Directory<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: Publ
 
 impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
     /// Create a new set of records using the given local node information.
-    pub fn init(
-        context: E,
-        myself: (C, SocketAddr),
-        cfg: Config,
-        releaser: Releaser<E, C>,
-    ) -> Self {
+    pub fn init(context: E, myself: (C, SocketAddr), cfg: Config, releaser: Releaser<C>) -> Self {
         // Create the list of peers and add myself.
         let mut peers = HashMap::new();
         peers.insert(myself.0, Record::myself(myself.1));
 
         // Other initialization.
         let rate_limiter = RateLimiter::hashmap_with_clock(cfg.rate_limit, &context);
+
+        // TODO(#1833): Metrics should use the post-start context
         let metrics = Metrics::init(context.clone());
         metrics.tracked.set((peers.len() - 1) as i64); // Exclude self
 
         Self {
-            context,
             max_sets: cfg.max_sets,
             allow_private_ips: cfg.allow_private_ips,
             peers,
@@ -110,7 +105,7 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
     }
 
     /// Stores a new peer set.
-    pub fn add_set(&mut self, index: u64, peers: Vec<(C, SocketAddr)>) -> Vec<C> {
+    pub fn add_set(&mut self, index: u64, peers: Ordered<(C, SocketAddr)>) -> Vec<C> {
         // Check if peer set already exists
         if self.sets.contains_key(&index) {
             debug!(index, "peer set already exists");
@@ -159,7 +154,7 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
     /// Attempt to reserve a peer for the dialer.
     ///
     /// Returns `Some` on success, `None` otherwise.
-    pub fn dial(&mut self, peer: &C) -> Option<Reservation<E, C>> {
+    pub fn dial(&mut self, peer: &C) -> Option<Reservation<C>> {
         let socket = self.peers.get(peer)?.socket()?;
         self.reserve(Metadata::Dialer(peer.clone(), socket))
     }
@@ -167,7 +162,7 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
     /// Attempt to reserve a peer for the listener.
     ///
     /// Returns `Some` on success, `None` otherwise.
-    pub fn listen(&mut self, peer: &C) -> Option<Reservation<E, C>> {
+    pub fn listen(&mut self, peer: &C) -> Option<Reservation<C>> {
         self.reserve(Metadata::Listener(peer.clone()))
     }
 
@@ -207,12 +202,23 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
             .is_some_and(|r| r.listenable(self.allow_private_ips))
     }
 
+    /// Return all registered IP addresses.
+    pub fn registered(&self) -> HashSet<IpAddr> {
+        // Using `.allowed()` here excludes any peers that are still connected but no longer
+        // part of a peer set (and will be dropped shortly).
+        self.peers
+            .values()
+            .filter(|r| r.allowed(self.allow_private_ips))
+            .filter_map(|r| r.socket().map(|s| s.ip()))
+            .collect()
+    }
+
     // --------- Helpers ----------
 
     /// Attempt to reserve a peer.
     ///
     /// Returns `Some(Reservation)` if the peer was successfully reserved, `None` otherwise.
-    fn reserve(&mut self, metadata: Metadata<C>) -> Option<Reservation<E, C>> {
+    fn reserve(&mut self, metadata: Metadata<C>) -> Option<Reservation<C>> {
         let peer = metadata.public_key();
 
         // Not reservable
@@ -238,11 +244,7 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
         // Reserve
         if record.reserve() {
             self.metrics.reserved.inc();
-            return Some(Reservation::new(
-                self.context.clone(),
-                metadata,
-                self.releaser.clone(),
-            ));
+            return Some(Reservation::new(metadata, self.releaser.clone()));
         }
         None
     }
@@ -268,11 +270,12 @@ impl<E: Spawner + Rng + Clock + GClock + RuntimeMetrics, C: PublicKey> Directory
 
 #[cfg(test)]
 mod tests {
-    use crate::authenticated::lookup::actors::tracker::directory::Directory;
+    use crate::authenticated::{
+        lookup::actors::tracker::directory::Directory, mailbox::UnboundedMailbox,
+    };
     use commonware_cryptography::{ed25519, PrivateKeyExt, Signer};
     use commonware_runtime::{deterministic, Runner};
-    use commonware_utils::NZU32;
-    use futures::channel::mpsc;
+    use commonware_utils::{set::Ordered, NZU32};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
@@ -280,7 +283,7 @@ mod tests {
         let runtime = deterministic::Runner::default();
         let my_pk = ed25519::PrivateKey::from_seed(0).public_key();
         let my_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = UnboundedMailbox::new();
         let releaser = super::Releaser::new(tx);
         let config = super::Config {
             allow_private_ips: true,
@@ -298,23 +301,33 @@ mod tests {
         runtime.start(|context| async move {
             let mut directory = Directory::init(context, (my_pk, my_addr), config, releaser);
 
-            let deleted =
-                directory.add_set(0, vec![(pk_1.clone(), addr_1), (pk_2.clone(), addr_2)]);
+            let deleted = directory.add_set(
+                0,
+                Ordered::new_by_key(
+                    [(pk_1.clone(), addr_1), (pk_2.clone(), addr_2)],
+                    |(pk, _)| pk,
+                ),
+            );
             assert!(
                 deleted.is_empty(),
                 "No peers should be deleted on first set"
             );
 
-            let deleted =
-                directory.add_set(1, vec![(pk_2.clone(), addr_2), (pk_3.clone(), addr_3)]);
+            let deleted = directory.add_set(
+                1,
+                Ordered::new_by_key(
+                    [(pk_2.clone(), addr_2), (pk_3.clone(), addr_3)],
+                    |(pk, _)| pk,
+                ),
+            );
             assert_eq!(deleted.len(), 1, "One peer should be deleted");
             assert!(deleted.contains(&pk_1), "Deleted peer should be pk_1");
 
-            let deleted = directory.add_set(2, vec![(pk_3.clone(), addr_3)]);
+            let deleted = directory.add_set(2, vec![(pk_3.clone(), addr_3)].into());
             assert_eq!(deleted.len(), 1, "One peer should be deleted");
             assert!(deleted.contains(&pk_2), "Deleted peer should be pk_2");
 
-            let deleted = directory.add_set(3, vec![(pk_3.clone(), addr_3)]);
+            let deleted = directory.add_set(3, vec![(pk_3.clone(), addr_3)].into());
             assert!(deleted.is_empty(), "No peers should be deleted");
         });
     }

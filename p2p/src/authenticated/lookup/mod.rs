@@ -21,6 +21,9 @@
 //! On startup, the application supplies the initial set of peers. The `Oracle` actor allows
 //! the application to update peer --> address mappings so that peers can find each other.
 //!
+//! Any inbound connection attempts from an IP address that is not in the union of all registered
+//! peer sets will be rejected.
+//!
 //! ## Messages
 //!
 //! Application-level data is exchanged using the `Data` message type. This structure contains:
@@ -45,19 +48,32 @@
 //! appropriate mitigations (such as ensuring no attacker-controlled data is compressed
 //! alongside sensitive information).
 //!
+//! ## Rate Limiting
+//!
+//! There are five primary rate limits:
+//!
+//! - `max_concurrent_handshakes`: The maximum number of concurrent handshake attempts allowed.
+//! - `allowed_handshake_rate_per_ip`: The rate limit for handshake attempts originating from a single IP address.
+//! - `allowed_handshake_rate_per_subnet`: The rate limit for handshake attempts originating from a single IP subnet.
+//! - `allowed_connection_rate_per_peer`: The rate limit for connections to a single peer (incoming or outgoing).
+//! - `rate` (per channel): The rate limit for messages sent on a single channel.
+//!
+//! _Users should consider these rate limits as best-effort protection against moderate abuse. Targeted abuse (e.g. DDoS)
+//! must be mitigated with an external proxy (that limits inbound connection attempts to authorized IPs)._
+//!
 //! # Example
 //!
 //! ```rust
 //! use commonware_p2p::{authenticated::lookup::{self, Network}, Sender, Recipients};
 //! use commonware_cryptography::{ed25519, Signer, PrivateKey as _, PublicKey as _, PrivateKeyExt as _};
-//! use commonware_runtime::{tokio, Spawner, Runner, Metrics};
-//! use commonware_utils::NZU32;
+//! use commonware_runtime::{deterministic, Spawner, Runner, Metrics};
+//! use commonware_utils::{NZU32, set::Ordered};
 //! use governor::Quota;
 //! use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 //!
 //! // Configure context
-//! let runtime_cfg = tokio::Config::default();
-//! let runner = tokio::Runner::new(runtime_cfg.clone());
+//! let runtime_cfg = deterministic::Config::default();
+//! let runner = deterministic::Runner::new(runtime_cfg.clone());
 //!
 //! // Generate identity
 //! //
@@ -85,7 +101,7 @@
 //! //
 //! // In production, use a more conservative configuration like `Config::recommended`.
 //! const MAX_MESSAGE_SIZE: usize = 1_024; // 1KB
-//! let p2p_cfg = lookup::Config::aggressive(
+//! let p2p_cfg = lookup::Config::local(
 //!     my_sk.clone(),
 //!     application_namespace,
 //!     my_addr,
@@ -102,7 +118,10 @@
 //!     //
 //!     // In production, this would be updated as new peer sets are created (like when
 //!     // the composition of a validator set changes).
-//!     oracle.register(0, vec![(my_sk.public_key(), my_addr), (peer1, peer1_addr), (peer2, peer2_addr), (peer3, peer3_addr)]).await;
+//!     oracle.register(
+//!         0,
+//!         Ordered::new_by_key([(my_sk.public_key(), my_addr), (peer1, peer1_addr), (peer2, peer2_addr), (peer3, peer3_addr)], |(pk, _)| pk)
+//!     ).await;
 //!
 //!     // Register some channel
 //!     const MAX_MESSAGE_BACKLOG: usize = 128;
@@ -151,11 +170,11 @@ mod tests {
     use super::*;
     use crate::{Receiver, Recipients, Sender};
     use commonware_cryptography::{ed25519, PrivateKeyExt as _, Signer as _};
-    use commonware_macros::test_traced;
+    use commonware_macros::{select, test_traced};
     use commonware_runtime::{
         deterministic, tokio, Clock, Metrics, Network as RNetwork, Runner, Spawner,
     };
-    use commonware_utils::NZU32;
+    use commonware_utils::{set::Ordered, NZU32};
     use futures::{channel::mpsc, SinkExt, StreamExt};
     use governor::{clock::ReasonablyRealtime, Quota};
     use rand::{CryptoRng, Rng};
@@ -227,7 +246,9 @@ mod tests {
             let (mut network, mut oracle) = Network::new(context.with_label("network"), config);
 
             // Register peers
-            oracle.register(0, peers.clone()).await;
+            oracle
+                .register(0, Ordered::new_by_key(peers.clone(), |(pk, _)| pk))
+                .await;
 
             // Register basic application
             let (mut sender, mut receiver) =
@@ -254,7 +275,7 @@ mod tests {
                 let mut complete_sender = complete_sender.clone();
                 move |context| async move {
                     // Wait for all peers to send their identity
-                    context.with_label("receiver").spawn(move |_| async move {
+                    let receiver = context.with_label("receiver").spawn(move |_| async move {
                         // Wait for all peers to send their identity
                         let mut received = HashSet::new();
                         while received.len() < n - 1 {
@@ -274,7 +295,7 @@ mod tests {
                     });
 
                     // Send identity to all peers
-                    context
+                    let sender = context
                         .with_label("sender")
                         .spawn(move |context| async move {
                             // Loop forever to account for unexpected message drops
@@ -366,6 +387,16 @@ mod tests {
                                 context.sleep(Duration::from_secs(10)).await;
                             }
                         });
+
+                    // Neither task should exit
+                    select! {
+                        receiver = receiver => {
+                            panic!("receiver exited: {receiver:?}");
+                        },
+                        sender = sender => {
+                            panic!("sender exited: {sender:?}");
+                        },
+                    }
                 }
             });
         }
@@ -441,8 +472,7 @@ mod tests {
 
     #[test_traced]
     fn test_tokio_connectivity() {
-        let cfg = tokio::Config::default();
-        let executor = tokio::Runner::new(cfg.clone());
+        let executor = tokio::Runner::default();
         executor.start(|context| async move {
             const MAX_MESSAGE_SIZE: usize = 1_024 * 1_024; // 1MB
             let base_port = 4000;
@@ -488,9 +518,14 @@ mod tests {
                 let (mut network, mut oracle) = Network::new(context.with_label("network"), config);
 
                 // Register peers at separate indices
-                oracle.register(0, vec![peers[0].clone()]).await;
                 oracle
-                    .register(1, vec![peers[1].clone(), peers[2].clone()])
+                    .register(0, Ordered::new_by_key([peers[0].clone()], |(pk, _)| pk))
+                    .await;
+                oracle
+                    .register(
+                        1,
+                        Ordered::new_by_key([peers[1].clone(), peers[2].clone()], |(pk, _)| pk),
+                    )
                     .await;
                 oracle
                     .register(2, peers.iter().skip(2).cloned().collect())
@@ -563,10 +598,12 @@ mod tests {
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base_port + i as u16);
                 peers_and_sks.push((peer_sk, peer_pk, peer_addr));
             }
-            let peers = peers_and_sks
-                .iter()
-                .map(|(_, pk, addr)| (pk.clone(), *addr))
-                .collect::<Vec<_>>();
+            let peers = {
+                let iter = peers_and_sks
+                    .iter()
+                    .map(|(_, pk, addr)| (pk.clone(), *addr));
+                Ordered::new_by_key(iter, |(pk, _)| pk)
+            };
 
             // Create network
             let (sk, _, addr) = peers_and_sks[0].clone();
@@ -616,10 +653,12 @@ mod tests {
                 let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base_port + i as u16);
                 peers_and_sks.push((sk, pk, addr));
             }
-            let peers = peers_and_sks
-                .iter()
-                .map(|(_, pk, addr)| (pk.clone(), *addr))
-                .collect::<Vec<_>>();
+            let peers = {
+                let iter = peers_and_sks
+                    .iter()
+                    .map(|(_, pk, addr)| (pk.clone(), *addr));
+                Ordered::new_by_key(iter, |(pk, _)| pk)
+            };
             let (sk0, _, addr0) = peers_and_sks[0].clone();
             let (sk1, pk1, addr1) = peers_and_sks[1].clone();
 

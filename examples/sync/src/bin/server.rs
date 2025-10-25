@@ -1,5 +1,5 @@
 //! Server that serves operations and proofs to clients attempting to sync a
-//! [commonware_storage::adb::any::fixed::Any] database.
+//! [commonware_storage::adb::any::fixed::unordered::Any] database.
 
 use clap::{Arg, Command};
 use commonware_codec::{DecodeExt, Encode};
@@ -8,7 +8,7 @@ use commonware_runtime::{
     tokio as tokio_runtime, Clock, Listener, Metrics, Network, Runner, RwLock, SinkOf, Spawner,
     Storage, StreamOf,
 };
-use commonware_storage::{adb::sync::Target, mmr::hasher::Standard};
+use commonware_storage::{adb::sync::Target, mmr::StandardHasher as Standard};
 use commonware_stream::utils::codec::{recv_frame, send_frame};
 use commonware_sync::{
     any::{self},
@@ -18,12 +18,13 @@ use commonware_sync::{
     net::{wire, ErrorCode, ErrorResponse, MAX_MESSAGE_SIZE},
     Error, Key,
 };
-use commonware_utils::parse_duration;
+use commonware_utils::DurationExt;
 use futures::{channel::mpsc, SinkExt, StreamExt};
 use prometheus_client::metrics::counter::Counter;
 use rand::{Rng, RngCore};
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    num::NonZeroU64,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -118,8 +119,8 @@ where
         // Add operations to database and get the new root
         let root = {
             let mut database = state.database.write().await;
-            if let Err(e) = DB::add_operations(&mut *database, new_operations.clone()).await {
-                error!(error = %e, "failed to add operations to database");
+            if let Err(err) = DB::add_operations(&mut *database, new_operations.clone()).await {
+                error!(?err, "failed to add operations to database");
             }
             DB::root(&*database, &mut Standard::new())
         };
@@ -151,21 +152,20 @@ where
     state.request_counter.inc();
 
     // Get the current database state
-    let (root, lower_bound_ops, upper_bound_ops) = {
+    let (root, lower_bound, upper_bound) = {
         let mut hasher = Standard::new();
         let database = state.database.read().await;
         (
             database.root(&mut hasher),
-            database.lower_bound_ops(),
-            database.op_count().saturating_sub(1),
+            database.lower_bound(),
+            database.op_count(),
         )
     };
     let response = wire::GetSyncTargetResponse::<Key> {
         request_id: request.request_id,
         target: Target {
             root,
-            lower_bound_ops,
-            upper_bound_ops,
+            range: lower_bound..upper_bound,
         },
     };
 
@@ -196,27 +196,29 @@ where
     }
 
     // Calculate how many operations to return
-    let max_ops = std::cmp::min(request.max_ops.get(), db_size - request.start_loc);
+    let max_ops = std::cmp::min(request.max_ops.get(), *db_size - *request.start_loc);
     let max_ops = std::cmp::min(max_ops, MAX_BATCH_SIZE);
+    let max_ops =
+        NonZeroU64::new(max_ops).expect("max_ops cannot be zero since start_loc < db_size");
 
     debug!(
         request_id = request.request_id,
         max_ops,
-        start_loc = request.start_loc,
-        db_size,
+        start_loc = ?request.start_loc,
+        ?db_size,
         "operations request"
     );
 
     // Get the historical proof and operations
     let result = database
-        .historical_proof(request.size, request.start_loc, max_ops)
+        .historical_proof(request.op_count, request.start_loc, max_ops)
         .await;
 
     drop(database);
 
-    let (proof, operations) = result.map_err(|e| {
-        warn!(error = %e, "failed to generate historical proof");
-        Error::Database(e)
+    let (proof, operations) = result.map_err(|err| {
+        warn!(?err, "failed to generate historical proof");
+        Error::Database(err)
     })?;
 
     debug!(
@@ -307,8 +309,8 @@ where
                         // Parse the message.
                         let message = match wire::Message::decode(&message_data[..]) {
                             Ok(msg) => msg,
-                            Err(e) => {
-                                warn!(client_addr = %client_addr, error = %e, "failed to parse message");
+                            Err(err) => {
+                                warn!(client_addr = %client_addr, ?err, "failed to parse message");
                                 state.error_counter.inc();
                                 continue;
                             }
@@ -321,14 +323,14 @@ where
                             let mut response_sender = response_sender.clone();
                             move |_| async move {
                                 let response = handle_message::<DB>(&state, message).await;
-                                if let Err(e) = response_sender.send(response).await {
-                                    warn!(client_addr = %client_addr, error = %e, "failed to send response to main loop");
+                                if let Err(err) = response_sender.send(response).await {
+                                    warn!(client_addr = %client_addr, ?err, "failed to send response to main loop");
                                 }
                             }
                         });
                     }
-                    Err(e) => {
-                        info!(client_addr = %client_addr, error = %e, "recv failed (client likely disconnected)");
+                    Err(err) => {
+                        info!(client_addr = %client_addr, ?err, "recv failed (client likely disconnected)");
                         state.error_counter.inc();
                         break Ok(());
                     }
@@ -339,8 +341,8 @@ where
                 if let Some(response) = outgoing {
                     // We have a response to send to the client.
                     let response_data = response.encode().to_vec();
-                    if let Err(e) = send_frame(&mut sink, &response_data, MAX_MESSAGE_SIZE).await {
-                        info!(client_addr = %client_addr, error = %e, "send failed (client likely disconnected)");
+                    if let Err(err) = send_frame(&mut sink, &response_data, MAX_MESSAGE_SIZE).await {
+                        info!(client_addr = %client_addr, ?err, "send failed (client likely disconnected)");
                         state.error_counter.inc();
                         break Ok(());
                     }
@@ -385,7 +387,7 @@ where
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     info!(
-        op_count = database.op_count(),
+        op_count = ?database.op_count(),
         root = %root_hex,
         "{} database ready",
         DB::name()
@@ -425,8 +427,8 @@ where
         select! {
             _ = context.sleep_until(next_op_time) => {
                 // Add operations to the database
-                if let Err(e) = maybe_add_operations(&state, &mut context, &config).await {
-                    warn!(error = %e, "failed to add additional operations");
+                if let Err(err) = maybe_add_operations(&state, &mut context, &config).await {
+                    warn!(?err, "failed to add additional operations");
                 }
                 next_op_time = context.current() + config.op_interval;
             },
@@ -434,17 +436,16 @@ where
                 match client_result {
                     Ok((client_addr, sink, stream)) => {
                         let state = state.clone();
-                        let context = context.clone();
                         context.with_label("client").spawn(move|context|async move {
-                            if let Err(e) =
-                                handle_client::<DB, _>(context, state.clone(), sink, stream, client_addr).await
+                            if let Err(err) =
+                                handle_client::<DB, _>(context, state, sink, stream, client_addr).await
                             {
-                                error!(client_addr = %client_addr, error = %e, "❌ error handling client");
+                                error!(client_addr = %client_addr, ?err, "❌ error handling client");
                             }
                         });
                     }
-                    Err(e) => {
-                        error!(error = %e, "❌ failed to accept client");
+                    Err(err) => {
+                        error!(?err, "❌ failed to accept client");
                     }
                 }
             }
@@ -574,7 +575,7 @@ fn parse_config() -> Result<Config, Box<dyn std::error::Error>> {
             .unwrap()
             .parse()
             .map_err(|e| format!("Invalid metrics port: {e}"))?,
-        op_interval: parse_duration(matches.get_one::<String>("op-interval").unwrap())
+        op_interval: Duration::parse(matches.get_one::<String>("op-interval").unwrap())
             .map_err(|e| format!("Invalid operation interval: {e}"))?,
         ops_per_interval: matches
             .get_one::<String>("ops-per-interval")
@@ -620,8 +621,8 @@ fn main() {
             DatabaseType::Immutable => run_immutable(context, config).await,
         };
 
-        if let Err(e) = result {
-            error!(error = %e, "❌ server failed");
+        if let Err(err) = result {
+            error!(?err, "❌ server failed");
         }
     });
 }

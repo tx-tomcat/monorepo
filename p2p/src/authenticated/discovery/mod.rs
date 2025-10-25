@@ -45,10 +45,10 @@
 //!
 //! Upon receiving a `BitVec` message, a peer compares it against its own knowledge for the same
 //! index. If the receiving peer knows addresses that the sender marked as '0' (unknown), it
-//! selects a random subset of these known `PeerInfo` structures (up to `peer_gossip_max_count`)
+//! selects a random subset of these known `Info` structures (up to `peer_gossip_max_count`)
 //! and sends them back in a `Payload::Peers` message. To save bandwidth, peers will only gossip
-//! `PeerInfo` for peers that they currently have a connection with. This prevents them from
-//! repeatedly sending `PeerInfo` that they cannot verify is still valid. Each `PeerInfo` contains:
+//! `Info` for peers that they currently have a connection with. This prevents them from
+//! repeatedly sending `Info` that they cannot verify is still valid. Each `Info` contains:
 //! - `socket`: The [std::net::SocketAddr] of the peer.
 //! - `timestamp`: A `u64` timestamp indicating when the address was attested.
 //! - `public_key`: The peer's public key.
@@ -57,16 +57,16 @@
 //! If the receiver doesn't know any addresses the sender is unaware of, it sends no
 //! `Payload::Peers` response; the received `BitVec` implicitly acts as a "pong".
 //!
-//! If a peer receives a `PeerInfo` message (either directly or through gossip) containing a more
+//! If a peer receives a `Info` message (either directly or through gossip) containing a more
 //! recent timestamp for a known peer's address, it updates its local `Record`. This updated
-//! `PeerInfo` is also used in future gossip messages. Each peer generates its own signed
-//! `PeerInfo` upon startup and sends it immediately after establishing a connection (following
+//! `Info` is also used in future gossip messages. Each peer generates its own signed
+//! `Info` upon startup and sends it immediately after establishing a connection (following
 //! the cryptographic handshake). This ensures that if a peer connects using an outdated address
 //! record, it will be corrected promptly by the peer being dialed.
 //!
 //! To initiate the discovery process, a peer needs a list of `bootstrappers` (defined in
 //! [Config]) - known peer public keys and their corresponding socket addresses. The peer
-//! attempts to dial these bootstrappers, performs the handshake, sends its own `PeerInfo`, and
+//! attempts to dial these bootstrappers, performs the handshake, sends its own `Info`, and
 //! then sends a `BitVec` for the relevant peer set(s) (initially only knowing its own address,
 //! marked as '1'). It then waits for responses, learning about other peers through the
 //! `Payload::Peers` messages received. Bootstrapper information is persisted, and connections to
@@ -106,19 +106,32 @@
 //! appropriate mitigations (such as ensuring no attacker-controlled data is compressed
 //! alongside sensitive information).
 //!
+//! ## Rate Limiting
+//!
+//! There are five primary rate limits:
+//!
+//! - `max_concurrent_handshakes`: The maximum number of concurrent handshake attempts allowed.
+//! - `allowed_handshake_rate_per_ip`: The rate limit for handshake attempts originating from a single IP address.
+//! - `allowed_handshake_rate_per_subnet`: The rate limit for handshake attempts originating from a single IP subnet.
+//! - `allowed_connection_rate_per_peer`: The rate limit for connections to a single peer (incoming or outgoing).
+//! - `rate` (per channel): The rate limit for messages sent on a single channel.
+//!
+//! _Users should consider these rate limits as best-effort protection against moderate abuse. Targeted abuse (e.g. DDoS)
+//! must be mitigated with an external proxy (that limits inbound connection attempts to authorized IPs)._
+//!
 //! # Example
 //!
 //! ```rust
 //! use commonware_p2p::{authenticated::discovery::{self, Network}, Sender, Recipients};
 //! use commonware_cryptography::{ed25519, Signer, PrivateKey as _, PublicKey as _, PrivateKeyExt as _};
-//! use commonware_runtime::{tokio, Spawner, Runner, Metrics};
+//! use commonware_runtime::{deterministic, Spawner, Runner, Metrics};
 //! use commonware_utils::NZU32;
 //! use governor::Quota;
 //! use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 //!
 //! // Configure context
-//! let runtime_cfg = tokio::Config::default();
-//! let runner = tokio::Runner::new(runtime_cfg.clone());
+//! let runtime_cfg = deterministic::Config::default();
+//! let runner = deterministic::Runner::new(runtime_cfg.clone());
 //!
 //! // Generate identity
 //! //
@@ -147,7 +160,7 @@
 //! //
 //! // In production, use a more conservative configuration like `Config::recommended`.
 //! const MAX_MESSAGE_SIZE: usize = 1_024; // 1KB
-//! let p2p_cfg = discovery::Config::aggressive(
+//! let p2p_cfg = discovery::Config::local(
 //!     signer.clone(),
 //!     application_namespace,
 //!     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3000),
@@ -165,7 +178,7 @@
 //!     //
 //!     // In production, this would be updated as new peer sets are created (like when
 //!     // the composition of a validator set changes).
-//!     oracle.register(0, vec![signer.public_key(), peer1, peer2, peer3]).await;
+//!     oracle.register(0, vec![signer.public_key(), peer1, peer2, peer3].into()).await;
 //!
 //!     // Register some channel
 //!     const MAX_MESSAGE_BACKLOG: usize = 128;
@@ -214,11 +227,11 @@ mod tests {
     use super::*;
     use crate::{Receiver, Recipients, Sender};
     use commonware_cryptography::{ed25519, PrivateKeyExt as _, Signer as _};
-    use commonware_macros::test_traced;
+    use commonware_macros::{select, test_traced};
     use commonware_runtime::{
         deterministic, tokio, Clock, Metrics, Network as RNetwork, Runner, Spawner,
     };
-    use commonware_utils::NZU32;
+    use commonware_utils::{set::Ordered, NZU32};
     use futures::{channel::mpsc, SinkExt, StreamExt};
     use governor::{clock::ReasonablyRealtime, Quota};
     use rand::{CryptoRng, Rng};
@@ -300,7 +313,7 @@ mod tests {
             let (mut network, mut oracle) = Network::new(context.with_label("network"), config);
 
             // Register peers
-            oracle.register(0, addresses.clone()).await;
+            oracle.register(0, addresses.clone().into()).await;
 
             // Register basic application
             let (mut sender, mut receiver) =
@@ -315,7 +328,7 @@ mod tests {
                 let addresses = addresses.clone();
                 move |context| async move {
                     // Wait for all peers to send their identity
-                    context.with_label("receiver").spawn(move |_| async move {
+                    let receiver = context.with_label("receiver").spawn(move |_| async move {
                         // Wait for all peers to send their identity
                         let mut received = HashSet::new();
                         while received.len() < n - 1 {
@@ -336,7 +349,7 @@ mod tests {
 
                     // Send identity to all peers
                     let msg = signer.public_key();
-                    context
+                    let sender = context
                         .with_label("sender")
                         .spawn(move |context| async move {
                             // Loop forever to account for unexpected message drops
@@ -424,6 +437,16 @@ mod tests {
                                 context.sleep(Duration::from_secs(10)).await;
                             }
                         });
+
+                    // Neither task should exit
+                    select! {
+                        receiver = receiver => {
+                            panic!("receiver exited: {receiver:?}");
+                        },
+                        sender = sender => {
+                            panic!("sender exited: {sender:?}");
+                        },
+                    }
                 }
             });
         }
@@ -499,8 +522,7 @@ mod tests {
 
     #[test_traced]
     fn test_tokio_connectivity() {
-        let cfg = tokio::Config::default();
-        let executor = tokio::Runner::new(cfg.clone());
+        let executor = tokio::Runner::default();
         executor.start(|context| async move {
             const MAX_MESSAGE_SIZE: usize = 1_024 * 1_024; // 1MB
             let base_port = 3000;
@@ -554,9 +576,14 @@ mod tests {
                 let (mut network, mut oracle) = Network::new(context.with_label("network"), config);
 
                 // Register peers at separate indices
-                oracle.register(0, vec![addresses[0].clone()]).await;
                 oracle
-                    .register(1, vec![addresses[1].clone(), addresses[2].clone()])
+                    .register(0, Ordered::from_iter([addresses[0].clone()]))
+                    .await;
+                oracle
+                    .register(
+                        1,
+                        Ordered::from_iter([addresses[1].clone(), addresses[2].clone()]),
+                    )
                     .await;
                 oracle
                     .register(2, addresses.iter().skip(2).cloned().collect())
@@ -625,7 +652,7 @@ mod tests {
             for i in 0..n {
                 peers.push(ed25519::PrivateKey::from_seed(i as u64));
             }
-            let addresses = peers.iter().map(|p| p.public_key()).collect::<Vec<_>>();
+            let addresses = peers.iter().map(|p| p.public_key()).collect::<Ordered<_>>();
 
             // Create network
             let signer = peers[0].clone();
@@ -686,7 +713,7 @@ mod tests {
                 1_024 * 1_024, // 1MB
             );
             let (mut network0, mut oracle0) = Network::new(context.with_label("peer-0"), config0);
-            oracle0.register(0, addresses.clone()).await;
+            oracle0.register(0, addresses.clone().into()).await;
             let (mut sender0, _receiver0) =
                 network0.register(0, Quota::per_hour(NZU32!(1)), DEFAULT_MESSAGE_BACKLOG);
             network0.start();
@@ -700,7 +727,7 @@ mod tests {
                 1_024 * 1_024, // 1MB
             );
             let (mut network1, mut oracle1) = Network::new(context.with_label("peer-1"), config1);
-            oracle1.register(0, addresses.clone()).await;
+            oracle1.register(0, addresses.clone().into()).await;
             let (_sender1, _receiver1) =
                 network1.register(0, Quota::per_hour(NZU32!(1)), DEFAULT_MESSAGE_BACKLOG);
             network1.start();
